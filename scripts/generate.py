@@ -480,7 +480,11 @@ def run(slug: str, which: list[str] | None = None, with_draft: bool = False,
         d = adir / "jsonld"
         d.mkdir(parents=True, exist_ok=True)
         for name, obj in gen_jsonld(slug).items():
-            G.write_document(d / f"{name}.json", json.dumps(obj, ensure_ascii=False, indent=2))
+            # JSON-LD 是事實聲明：品牌名、別名、網址、代碼不得被繁簡轉換改寫，
+            # 只有描述性欄位走繁體正規化。
+            G.write_document(d / f"{name}.json",
+                             json.dumps(obj, ensure_ascii=False, indent=2),
+                             json_translate_keys=G.JSONLD_TRANSLATABLE_KEYS)
             made.append(f"assets/jsonld/{name}.json")
 
     if "snippets" in which:

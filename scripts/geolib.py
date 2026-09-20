@@ -1,6 +1,6 @@
 """GEO 工具箱共用模块：路径、配置、HTTP、正文抽取。
 
-只依赖 requests / bs4 / lxml（标准 macOS Python 环境已有），不引入 yaml/jinja2。
+依赖 requests / bs4 / lxml / OpenCC，不引入 yaml/jinja2。
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,15 +19,17 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
+from opencc import OpenCC
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "work"
 
-# 人類可讀輸出一律使用繁體中文（台灣）。這份字形表與 UI 的 zh-TW
-# 轉換表採相同範圍，避免新增 OpenCC 等執行階段依賴。
+# 人類可讀輸出一律使用繁體中文（台灣）。OpenCC 負責完整的簡繁詞義轉換；
+# 這份字形表仍與 UI 的離線 zh-TW 轉換表共用，並作為簡繁字形辨識依據。
 ZHTW_FROM = "万与专业东丢两严个临为举么义习书买乱争于亏云产亿仅从仓们价众优会传伤体余侧储儿关兴内册写决况净准减凑几凭击划则刚创删别剥办务动势区协单占却厂历压参双发变叠台号后吗听启员响团园围国图场坏块声壳处备复够头夸宁宝实审对导将尔尸层属币师带帮干并库应开异弃张弹强归当录径忆态总恒悬惩惯愿戏战户托执扩扫扰抢护报担拟拥拦择挂挡挤损换据携撑数斗断无旧时显暂术机杀杂权杠条来极构栅标栏树样档检槛横残气汇汉没浅测浏涨满滤滥灭点状独环现画监盖盘着码础确礼离种积称稳竖竞笔筛签简类纠约级纪纯纲纳线组细织终经绑结给绝统继绪续维综缀编缘网罚联脑脚脱腾节范荐获营蓝虑补装见观规视览触计订认讨让议讯记讲许论设访证评识诉诊词译试诚话询该详语误说请诺读谁调谱负责败账质购贴费资赖赢趋踪车转轮软轻载较辑输边达过运还这进远连迟适选递逻邻采释里鉴钟钥钱钻铺链销锁锋错锚键长门闭问间闻阅阈队阳阵阶际险随隐难静页顶项顺须顾顿预领颈频题额风饰马驱验骗骤齐"
 ZHTW_TO = "萬與專業東丟兩嚴個臨為舉麼義習書買亂爭於虧雲產億僅從倉們價眾優會傳傷體餘側儲兒關興內冊寫決況淨準減湊幾憑擊劃則剛創刪別剝辦務動勢區協單佔卻廠歷壓參雙發變疊臺號後嗎聽啟員響團園圍國圖場壞塊聲殼處備復夠頭誇寧寶實審對導將爾屍層屬幣師帶幫幹並庫應開異棄張彈強歸當錄徑憶態總恆懸懲慣願戲戰戶託執擴掃擾搶護報擔擬擁攔擇掛擋擠損換據攜撐數鬥斷無舊時顯暫術機殺雜權槓條來極構柵標欄樹樣檔檢檻橫殘氣匯漢沒淺測瀏漲滿濾濫滅點狀獨環現畫監蓋盤著碼礎確禮離種積稱穩豎競筆篩籤簡類糾約級紀純綱納線組細織終經綁結給絕統繼緒續維綜綴編緣網罰聯腦腳脫騰節範薦獲營藍慮補裝見觀規視覽觸計訂認討讓議訊記講許論設訪證評識訴診詞譯試誠話詢該詳語誤說請諾讀誰調譜負責敗賬質購貼費資賴贏趨蹤車轉輪軟輕載較輯輸邊達過運還這進遠連遲適選遞邏鄰採釋裡鑑鍾鑰錢鑽鋪鏈銷鎖鋒錯錨鍵長門閉問間聞閱閾隊陽陣階際險隨隱難靜頁頂項順須顧頓預領頸頻題額風飾馬驅驗騙驟齊"
 ZHTW_TERMS = (
+    ("箇", "個"), ("識別", "辨識"),
     ("生成式引擎優化平臺", "生成式引擎最佳化平台"), ("搜尋引擎優化", "搜尋引擎最佳化"),
     ("接入新品牌", "新增品牌"), ("接入引導", "新增品牌引導"), ("國內引擎", "中國引擎"),
     ("國內市場", "中國市場"), ("人工智能", "人工智慧"), ("文件夾", "資料夾"),
@@ -45,7 +48,53 @@ ZHTW_TERMS = (
     ("進程", "程序"), ("程序", "程式"), ("官網", "官方網站"), ("打印", "列印"),
     ("回歸", "迴歸"), ("定時器", "排程器"), ("取舍", "取捨"),
 )
-_ZHTW_TRANSLATION = str.maketrans(ZHTW_FROM, ZHTW_TO)
+_OPENCC_S2TWP = OpenCC("s2twp")
+_ZH_HANS_MARKERS = frozenset(ZHTW_FROM) - frozenset(ZHTW_TO)
+_ZH_HANT_MARKERS = frozenset(ZHTW_TO) - frozenset(ZHTW_FROM)
+_PROTECTED_TEXT = re.compile(
+    r"(```.*?```|~~~.*?~~~|"
+    r"<(?:pre|code|script|style)\b[^>]*>.*?</(?:pre|code|script|style)\s*>|"
+    r"`[^`\r\n]+`|https?://[^\s<>\]\)\"'，。；！？、（）【】《》「」『』“”‘’]+|"
+    r"^(?: {4}|\t).*?$)",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
+
+def chinese_script_profile(text: str, lang_attr: str = "") -> dict:
+    """辨識中文使用 zh-Hans 或 zh-Hant，並回傳可稽核的信心值與字形計數。"""
+    value = str(text or "")
+    hans = sum(c in _ZH_HANS_MARKERS for c in value)
+    hant = sum(c in _ZH_HANT_MARKERS for c in value)
+    total = hans + hant
+    attr = (lang_attr or "").lower().replace("_", "-")
+    hint = ("zh-Hans" if attr.startswith(("zh-cn", "zh-sg", "zh-hans")) else
+            "zh-Hant" if attr.startswith(("zh-tw", "zh-hk", "zh-mo", "zh-hant")) else "zh")
+
+    if total:
+        confidence = round(max(hans, hant) / total, 3)
+        if hans > hant:
+            language = "zh-Hans"
+        elif hant > hans:
+            language = "zh-Hant"
+        else:
+            language = hint
+            confidence = 0.5 if hint != "zh" else 0.0
+    else:
+        language = hint
+        confidence = 0.55 if hint != "zh" else 0.0
+    return {
+        "language": language,
+        "confidence": confidence,
+        "hans_markers": hans,
+        "hant_markers": hant,
+    }
+
+
+def _convert_zh_tw_plain(text: str) -> str:
+    out = _OPENCC_S2TWP.convert(text)
+    for source, target in sorted(ZHTW_TERMS, key=lambda pair: len(pair[0]), reverse=True):
+        out = out.replace(source, target)
+    return out
 
 
 def load_env(path: Path | None = None):
@@ -101,20 +150,84 @@ def info(msg: str):
 
 
 def to_zh_tw(text: str) -> str:
-    """將人類可讀文字轉成繁體中文（台灣用語）；英文與程式符號不受影響。"""
-    out = str(text).translate(_ZHTW_TRANSLATION)
-    for source, target in sorted(ZHTW_TERMS, key=lambda pair: len(pair[0]), reverse=True):
-        out = out.replace(source, target)
-    return out
+    """轉成台灣繁體；程式碼、HTML 程式區塊、縮排程式碼與網址保持原樣。"""
+    value = str(text)
+    out = []
+    pos = 0
+    for match in _PROTECTED_TEXT.finditer(value):
+        out.append(_convert_zh_tw_plain(value[pos:match.start()]))
+        out.append(match.group(0))
+        pos = match.end()
+    out.append(_convert_zh_tw_plain(value[pos:]))
+    return "".join(out)
 
 
-def write_document(path: Path, text: str):
-    """以 UTF-8 原子寫入繁體中文人類可讀文件。"""
+# JSON-LD 的身分欄位是品牌事實（註冊名、別名、網址、代碼、日期），繁簡轉換會把它們
+# 改寫成另一個不存在的名字，讓結構化資料與事實庫對不上。寫這類檔案時只翻譯描述欄位，
+# 其餘一律保留原文；需要在地名稱時，靠 brand.aliases 另外登記經確認的繁體別名。
+JSONLD_TRANSLATABLE_KEYS = frozenset({
+    "description", "about", "abstract", "disambiguatingDescription", "text",
+    "audienceType",
+})
+
+
+def _normalize_json_values(value, translate_keys=None, translate=True):
+    """JSON key 屬於資料結構不可翻譯，只正規化人類可讀的字串值。
+
+    translate_keys 是 None 時整份翻譯；給定集合時只翻譯該集合內的 key，
+    其餘欄位（品牌名、別名、網址、代碼等事實）原樣保留，子結構一併繼承。
+    """
+    if isinstance(value, str):
+        return to_zh_tw(value) if translate else value
+    if isinstance(value, list):
+        return [_normalize_json_values(item, translate_keys, translate) for item in value]
+    if isinstance(value, dict):
+        return {key: _normalize_json_values(
+                    item, translate_keys,
+                    translate if translate_keys is None else key in translate_keys)
+                for key, item in value.items()}
+    return value
+
+
+def atomic_write(path: Path, text: str):
+    """同目錄唯一暫存檔 + os.replace()。
+
+    PID 不足以區分同一程序裡的多個執行緒——看板是 ThreadingHTTPServer，兩個請求
+    同時寫同一個檔就會共用暫存路徑，先完成的那個 rename 走檔案，另一個撞上
+    FileNotFoundError。改用 mkstemp 取唯一名字，落盤後再 replace。
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(to_zh_tw(text), "utf-8")
-    os.replace(tmp, p)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def write_document(path: Path, text: str, json_translate_keys=None):
+    """以 UTF-8 原子寫入繁體中文人類可讀文件。
+
+    json_translate_keys 只對 .json 生效：給定欄位集合時僅翻譯這些欄位，
+    其餘保留原文（JSON-LD 等事實型結構化資料用）。
+    """
+    p = Path(path)
+    rendered = to_zh_tw(text)
+    if p.suffix.lower() == ".json":
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            pass
+        else:
+            rendered = json.dumps(
+                _normalize_json_values(payload, json_translate_keys),
+                ensure_ascii=False, indent=2)
+            if str(text).endswith("\n"):
+                rendered += "\n"
+    atomic_write(p, rendered)
 
 
 # ---------------------------------------------------------------- 项目目录
@@ -168,14 +281,11 @@ def save_config(slug: str, cfg: dict):
         old = sorted(bak.glob("geo-*.json"))
         for f in old[:-10]:
             f.unlink()
-    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+    atomic_write(p, json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
 def write_json(path: Path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-    os.replace(tmp, path)
+    atomic_write(Path(path), json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def read_json(path: Path, default=None):
@@ -247,7 +357,7 @@ def fetch(url: str, timeout: int = 12, retries: int = 1, ua: str | None = None) 
       for attempt in range(retries + 1):
         try:
             t0 = time.time()
-            headers = {"User-Agent": cur_ua, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
+            headers = {"User-Agent": cur_ua, "Accept-Language": os.environ.get("GEO_ACCEPT_LANGUAGE", "zh-TW,zh-Hant;q=0.9,zh-CN;q=0.8,zh;q=0.7,en;q=0.6")}
             if ua_idx > 0:
                 headers["Accept"] = ("text/html,application/xhtml+xml,application/xml;"
                                      "q=0.9,image/avif,image/webp,*/*;q=0.8")
@@ -432,6 +542,13 @@ def main_text(soup: BeautifulSoup) -> str:
     clone = BeautifulSoup(str(body), "lxml")
     for t in clone(_DROP_TAGS):
         t.decompose()
+    # 保留程式碼邊界，讓後續簡繁正規化能跳過程式碼內容。
+    for t in clone.find_all("pre"):
+        code = t.get_text("\n", strip=True)
+        t.replace_with(f"\n```text\n{code}\n```\n")
+    for t in clone.find_all("code"):
+        code = t.get_text(" ", strip=True)
+        t.replace_with(f"`{code}`")
     for t in clone.find_all(attrs={"class": _BOILER}):
         t.decompose()
     for t in clone.find_all(attrs={"id": _BOILER}):
@@ -453,17 +570,22 @@ def cjk_ratio(text: str) -> float:
 
 
 def page_language(text: str, lang_attr: str = "") -> str:
-    """返回 zh / ja / en / mixed / unknown。html lang 属性只作参考，正文说了算。"""
+    """返回 zh-Hans / zh-Hant / zh / ja / en / mixed / unknown。"""
     if len(text) < 80:
         la = (lang_attr or "").lower()
-        return ("zh" if la.startswith("zh") else "en" if la.startswith("en")
+        kana = len(KANA.findall(text))
+        return ("ja" if kana >= 2
+                else chinese_script_profile(text, la)["language"]
+                if la.startswith("zh") or CJK.search(text)
+                else "en" if la.startswith("en")
                 else "ja" if la.startswith("ja") else "unknown")
     # 日文：假名够多且占（假名 + 汉字）比例明显，避免把引用了一两个日语词的中文页判成 ja
     kana = len(KANA.findall(text))
     if kana >= 5 and kana / (kana + len(CJK.findall(text))) > 0.2:
         return "ja"
     r = cjk_ratio(text)
-    return "zh" if r >= 0.5 else "en" if r <= 0.1 else "mixed"
+    return (chinese_script_profile(text, lang_attr)["language"] if r >= 0.5
+            else "en" if r <= 0.1 else "mixed")
 
 
 def word_count(text: str) -> int:

@@ -8,7 +8,7 @@ For a specific project: status analysis → diagnosis → strategy → implement
 
 English · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
-![License](https://img.shields.io/badge/license-MIT-9184d9) ![Python](https://img.shields.io/badge/python-3.9%2B-9184d9) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-9184d9) ![Deps](https://img.shields.io/badge/deps-requests%20·%20bs4%20·%20lxml-9184d9)
+![License](https://img.shields.io/badge/license-MIT-9184d9) ![Python](https://img.shields.io/badge/python-3.9%2B-9184d9) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-9184d9) ![Deps](https://img.shields.io/badge/deps-requests%20·%20bs4%20·%20lxml%20·%20OpenCC-9184d9)
 
 <a href="https://www.producthunt.com/products/geolook?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-geolook" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1211264&theme=dark&t=1786200566986" alt="GeoLook - Open-source, self-hosted platform for end-to-end GEO | Product Hunt" width="250" height="54" /></a>
 
@@ -85,7 +85,7 @@ Honest limits: single-machine tool, no accounts or team collaboration; sampling 
 
 - macOS or Linux (Windows via WSL — the code uses `fcntl` file locks)
 - Python **3.9+**
-- Exactly three third-party packages: `requests`, `beautifulsoup4`, `lxml`
+- Four third-party packages: `requests`, `beautifulsoup4`, `lxml`, `opencc-python-reimplemented`
 
 ### Three steps
 
@@ -93,10 +93,10 @@ Honest limits: single-machine tool, no accounts or team collaboration; sampling 
 # 1. Clone and install
 git clone https://github.com/aigclink/geolook.git
 cd geolook
-pip3 install requests beautifulsoup4 lxml
+pip3 install -r requirements.txt
 
 # 2. Start the dashboard (opens your browser)
-python3 scripts/geo.py ui        # → http://127.0.0.1:8765
+python3 scripts/geo.py ui --host 127.0.0.1  # → http://127.0.0.1:8765
 #    macOS: ./scripts/service.sh install registers it as a standing service
 #    (starts at login, restarts on crash, survives closing every terminal)
 
@@ -107,9 +107,11 @@ python3 scripts/geo.py ui        # → http://127.0.0.1:8765
 
 **Zero keys works too**: automated sampling is skipped; use the manual sampling sheet loop instead. Crawling, auditing, tickets and assets need no keys. One CN-capable key (e.g. DeepSeek/GLM) unlocks auto-derivation of the question bank / brand facts and AI first drafts.
 
+**Chinese normalization**: crawling requests Taiwan Traditional Chinese first, distinguishes `zh-Hans` from `zh-Hant`, and keeps both the original text and an OpenCC `s2twp` normalized copy with confidence metadata. Code blocks, inline code, JSON keys, and URLs are preserved. Override the request preference with `GEO_ACCEPT_LANGUAGE` in `.env`.
+
 ### Remote / server deployment
 
-The server binds to `127.0.0.1` by default. Two ways to access it remotely:
+The server prefers the current Tailscale IPv4 and falls back to `127.0.0.1`. Set `GEOLOOK_TOKEN` before using Tailscale or another non-local address; startup refuses remote access without a token. `--host` overrides `GEOLOOK_HOST`, which overrides auto-detection. For local-only access, run `python3 scripts/geo.py ui --host 127.0.0.1`. Two ways to access it remotely:
 
 ```bash
 # Option A (recommended): SSH tunnel, no port exposed
@@ -122,6 +124,12 @@ python3 scripts/geo.py ui
 # Enter the token on first visit (or open http://server:8765/?token=TOKEN);
 # afterwards access is via HttpOnly cookie. API calls: X-Geolook-Token header.
 ```
+
+Write endpoints (every `POST /api/…`) are guarded independently of the token: they accept
+only `Content-Type: application/json`, reject a cross-origin `Origin`, and reject a `Host`
+that is neither an IP literal, `localhost`, nor a `*.ts.net` name — so a page you happen to
+have open cannot drive your dashboard, and a rebinding domain cannot pose as it. Reaching the
+dashboard through your own domain? List it in `GEOLOOK_ALLOWED_HOSTS` (comma-separated).
 
 For public deployments put an HTTPS reverse proxy (nginx/caddy) in front — a token over plain HTTP can be intercepted. `.env` and `work/` contain secrets and project data — mind file permissions.
 
@@ -159,6 +167,10 @@ lives on external channels anyway:
 ```bash
 python3 scripts/geo.py init --no-site --name "Product" --materials brief.md --market cn
 ```
+
+In the dashboard, tick **"no official website"** in step 1 of the onboarding wizard and give
+the brand/product name instead of a URL; the project opens straight into the materials editor
+(Brand Facts → "edit materials") and nothing is crawled.
 
 Your brief replaces site copy as the basis for brand facts, competitors and the question
 bank (omit `--materials` and a template is generated for you). Only three things differ:
@@ -214,7 +226,7 @@ All six audit dimensions are anchored in public empirical data; `scripts/audit.p
 
 ## Design principles & security boundaries
 
-- **Single-machine, self-hosted**: stdlib `http.server` on 127.0.0.1; no DB, no accounts; data is plain files
+- **Single-machine, self-hosted**: stdlib `http.server` on Tailscale IPv4 (localhost fallback); no DB, no accounts; data is plain files
 - **Never fabricate**: facts only from site copy; inventing competitor names is forbidden; AI drafts must pass lint + human review
 - **Verification is the product**: anything auto-verifiable never relies on someone saying "done"
 - **Publishing is always manual**: channel credentials in local `.env` (mode 600); every publish is an explicit click; WeChat/WordPress go to drafts only

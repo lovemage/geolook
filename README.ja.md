@@ -83,7 +83,7 @@ GEO 製品の大半は**モニタリング SaaS**です：言及率とランキ�
 
 - macOS または Linux（Windows は WSL 経由——コードが `fcntl` ファイルロックを使用）
 - Python **3.9+**
-- サードパーティ依存はちょうど 3 つ：`requests`、`beautifulsoup4`、`lxml`
+- サードパーティ依存は 4 つ：`requests`、`beautifulsoup4`、`lxml`、`opencc-python-reimplemented`
 
 ### 3 ステップ
 
@@ -91,10 +91,10 @@ GEO 製品の大半は**モニタリング SaaS**です：言及率とランキ�
 # 1. クローンしてインストール
 git clone https://github.com/aigclink/geolook.git
 cd geolook
-pip3 install requests beautifulsoup4 lxml
+pip3 install -r requirements.txt
 
 # 2. ダッシュボードを起動（ブラウザが開きます）
-python3 scripts/geo.py ui        # → http://127.0.0.1:8765
+python3 scripts/geo.py ui --host 127.0.0.1  # → http://127.0.0.1:8765
 
 # 3.（任意）エンジン API キーを設定
 #    A: ダッシュボード — 設定 → エンジンとキー → 「設定」（ローカル .env に書き込み）
@@ -103,9 +103,11 @@ python3 scripts/geo.py ui        # → http://127.0.0.1:8765
 
 **キーゼロでも動きます**：自動サンプリングはスキップされ、手動サンプリングシートのループを使います。クロール・監査・チケット・資産にキーは不要です。中国系エンジンのキー 1 つ（DeepSeek/GLM など）で、質問バンク / ブランドファクトの自動導出と AI 下書きが解放されます。
 
+**中国語の正規化**：クロールでは台湾繁体字を優先し、`zh-Hans` と `zh-Hant` を区別します。原文と OpenCC `s2twp` による正規化テキスト、信頼度メタデータを保存し、コードブロック、インラインコード、JSON キー、URL は変換しません。`.env` の `GEO_ACCEPT_LANGUAGE` で優先言語を上書きできます。
+
 ### リモート / サーバーデプロイ
 
-サーバーはデフォルトで `127.0.0.1` のみにバインドします。リモートアクセスは 2 通り：
+サーバーは Tailscale IPv4 を優先し、取得できない場合は `127.0.0.1` を使います。Tailscale などのリモートアドレスには `GEOLOOK_TOKEN` が必須です。優先順位は `--host` → `GEOLOOK_HOST` → 自動検出。ローカル限定は `python3 scripts/geo.py ui --host 127.0.0.1`。リモートアクセスは 2 通り：
 
 ```bash
 # 方法 A（推奨）：SSH トンネル。ポートを公開しない
@@ -118,6 +120,8 @@ python3 scripts/geo.py ui
 # 初回アクセス時にトークンを入力（または http://server:8765/?token=トークン を開く）。
 # 以降は HttpOnly cookie で認証。API 呼び出しは X-Geolook-Token ヘッダー。
 ```
+
+書き込みエンドポイント（すべての `POST /api/…`）はトークンとは別に守られています：`Content-Type: application/json` のみ受理し、クロスオリジンの `Origin` を拒否、IP リテラル・`localhost`・`*.ts.net` 以外の `Host` も拒否します。たまたま開いているページからダッシュボードを操作されることも、rebinding ドメインになりすまされることもありません。自前ドメインで開く場合は `GEOLOOK_ALLOWED_HOSTS`（カンマ区切り）に登録してください。
 
 公開デプロイでは HTTPS リバースプロキシ（nginx/caddy）を前段に——平文 HTTP のトークンは傍受されえます。`.env` と `work/` には秘密情報とプロジェクトデータが含まれます——ファイル権限に注意。
 
@@ -155,6 +159,10 @@ AI 可視性はもともと外部チャネルで決まります：
 ```bash
 python3 scripts/geo.py init --no-site --name "商品名" --materials 資料.md --market cn
 ```
+
+ダッシュボードからは、オンボーディング第 1 ステップで**「公式サイトなし」**にチェックし、
+URL の代わりにブランド／商品名を入力します。作成後はそのまま紹介資料エディタ
+（ブランド事実 →「紹介資料を編集」）に入り、クロールは走りません。
 
 資料テキストがサイト本文の代わりに、ブランドファクト・競合・質問バンクの導出基盤に
 なります（`--materials` 省略時はテンプレートを生成）。異なるのは 3 点のみ：クロール/監査を
@@ -207,7 +215,7 @@ python3 scripts/geo.py sample-import --slug <project> --file <sheet>
 
 ## 設計原則とセキュリティ境界
 
-- **単一マシン・セルフホスト**：標準ライブラリの `http.server` を 127.0.0.1 のみで起動。DB なし、アカウントなし。データはプレーンファイル
+- **単一マシン・セルフホスト**：標準ライブラリの `http.server` を Tailscale IPv4（取得できない場合は localhost）で起動。DB なし、アカウントなし。データはプレーンファイル
 - **決して捏造しない**：ファクトはサイト本文のみから。競合名の発明は禁止。AI 下書きは lint + 人間レビュー必須
 - **検証こそプロダクト**：自動検証できるものは、人の「完了しました」に依存しない
 - **公開は常に手動**：チャネル認証情報はローカル `.env`（mode 600）。公開は毎回明示的なクリック。WeChat/WordPress は下書きのみ

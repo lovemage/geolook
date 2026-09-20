@@ -57,6 +57,10 @@ button:disabled{opacity:.45;cursor:default}
   <div class="row"><input id="server" placeholder="http://127.0.0.1:8765" value="http://127.0.0.1:8765">
     <select id="slug" style="width:40%"></select></div>
   <div class="row" style="margin-top:6px">
+    <input id="token" type="password" autocomplete="off"
+      placeholder="访问令牌（看板设了 GEOLOOK_TOKEN 才需要）"></div>
+  <div class="small" style="margin-top:3px;color:var(--t600)">令牌存在扩展本地存储里，和看板 Cookie 一样是明文——共用电脑请用完清空。</div>
+  <div class="row" style="margin-top:6px">
     <button id="load" class="primary">载入队列</button>
     <span id="qmeta" class="small"></span></div>
   <div id="groups" class="chips"></div>

@@ -178,7 +178,7 @@ function progBar(p,f,w){ // 任务级 before/after：首测(f) → 当前(p) →
     <div class="bar" style="margin-top:3px;height:5px"><div style="height:100%;width:${Math.round(ratio*100)}%;background:${ratio>=1?'var(--a400)':'var(--accent)'};border-radius:4px"></div></div></div>`}
 const post=(u,b)=>api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
 let D=null,SLUG=null,R='overview',ACTIONS={},POLL=null,RUNNING=null,LASTJOB=null,LOGOFF=0;
-let ST={gapTab:'content',engSel:null,wq:null,obStep:1,obSlug:null,obNoSample:false,obFail:false,obUrl:'',obName:'',obMkt:'both'};
+let ST={gapTab:'content',engSel:null,wq:null,obStep:1,obSlug:null,obNoSample:false,obFail:false,obUrl:'',obName:'',obMkt:'both',obNoSite:false};
 
 function toast(m,k=''){const t=document.createElement('div');t.className='toast '+k;t.textContent=m;
   $('#toast').appendChild(t);setTimeout(()=>t.remove(),3800)}
@@ -199,7 +199,7 @@ function head(kicker,title,sub){return `<div class="kicker">${esc(kicker)}</div>
 
 /* ===================== 界面多语言(zh/zh-tw/en/ja) =====================
    简体中文是源文案。繁中使用台湾用语转换；en/ja 用「整句精确匹配 + 短节点词级替换」在渲染后翻译 DOM,
-   字典未覆盖的保持中文(优雅降级);项目数据(问题库/工单/阵地文案)跟随数据语言,不翻。*/
+   繁中模式也会正規化動態資料，但 pre/code/script/style/textarea 保持原文，避免破壞程式碼。*/
 const UI_LANGS=['zh','zh-tw','en','ja'];
 const ULANG=(()=>{
   let q=(new URLSearchParams(location.search).get('lang')||'').toLowerCase();
@@ -1044,11 +1044,12 @@ UI_RX['zh-tw']=[];
 function uiTranslate(root){
   if(ULANG==='zh'||!root)return;
   const d=UI_D[ULANG],subs=UI_SUB[ULANG];
-  if(root.nodeType===3){const t=root.nodeValue.trim();if(!t)return;
+  if(root.nodeType===3){
+    if(root.parentElement&&root.parentElement.closest('pre,code,script,style,textarea'))return;
+    const t=root.nodeValue.trim();if(!t)return;
     if(d[t]!=null){root.nodeValue=root.nodeValue.replace(t,d[t]);return}
     for(const[rx,tpl]of UI_RX[ULANG])if(rx.test(t)){root.nodeValue=root.nodeValue.replace(t,t.replace(rx,tpl));return}
-    if(ULANG==='zh-tw')for(const[rx]of UI_RX.en)if(rx.test(t)){
-      root.nodeValue=root.nodeValue.replace(t,toZhTW(t));return}
+    if(ULANG==='zh-tw'){root.nodeValue=toZhTW(root.nodeValue);return}
     if(t.length<=40){/* 词级替换仅当节点由已知词元+数字/标点组成——避免误伤数据文本 */
       let probe=t;for(const s of subs)probe=probe.split(s[0]).join('');
       if(!/[぀-ヿ一-鿿]/.test(probe)){
@@ -1059,7 +1060,8 @@ function uiTranslate(root){
   const ns=[];while(w.nextNode())ns.push(w.currentNode);
   ns.forEach(uiTranslate);
   (root.querySelectorAll?root.querySelectorAll('[title],[placeholder]'):[]).forEach(el=>{
-    ['title','placeholder'].forEach(a=>{const v=el.getAttribute(a);if(v&&d[v]!=null)el.setAttribute(a,d[v])})});
+    ['title','placeholder'].forEach(a=>{const v=el.getAttribute(a);if(!v)return;
+      if(d[v]!=null)el.setAttribute(a,d[v]);else if(ULANG==='zh-tw')el.setAttribute(a,toZhTW(v))})});
 }
 new MutationObserver(ms=>{if(ULANG==='zh')return;
   for(const m of ms)m.addedNodes.forEach(n=>uiTranslate(n))
@@ -1874,9 +1876,15 @@ function vFacts(){
         <div style="font-size:11.5px;color:var(--t600);line-height:1.45">AI 当前说法：${esc(c.ai.txt)}</div>
       </div>`).join('')||'<div class="muted">事实卡还没有可解析的内容</div>'}
     </div>
+    ${D.brand.site?'':`<div class="card elev" style="margin-top:18px;padding:16px;gap:8px">
+      <div style="font-size:13.5px;font-weight:500">介绍材料（取代官网正文）</div>
+      <div class="muted" style="font-size:12.5px;line-height:1.6">本项目没有自有网站，品牌事实、竞品与问题库都从这份材料推导。写得越具体推导越准；不知道的留空，别编——bootstrap 会把空缺标成「待确认」。</div>
+      <div class="row"><button class="btn btn-primary" onclick="editMaterials()">编辑介绍材料</button></div>
+    </div>`}
     <div class="row" style="margin-top:22px">
-      <button class="btn btn-primary" onclick="runAction('generate',{'--asset':'llms,jsonld,snippets'})">重新生成 llms.txt 与结构化数据</button>
-      <a class="btn btn-secondary" target="_blank" href="/files/${SLUG}/assets/llms.txt">查看 llms.txt</a>
+      ${D.brand.site?`<button class="btn btn-primary" onclick="runAction('generate',{'--asset':'llms,jsonld,snippets'})">重新生成 llms.txt 与结构化数据</button>
+      <a class="btn btn-secondary" target="_blank" href="/files/${SLUG}/assets/llms.txt">查看 llms.txt</a>`
+      :`<button class="btn btn-primary" onclick="runAction('generate',{'--asset':'snippets,outlines,attribution'})">重新生成内容资产</button>`}
       <button class="btn btn-secondary" onclick="editFactsSrc()">编辑源文件</button>
     </div>
     <p class="muted" style="font-size:12px;margin-top:14px">纪律：一句话定位必须在官网首屏、关于页、JSON-LD description、llms.txt 四处逐字一致。生成文件的去处见资产目录里的 DEPLOY.md。</p>
@@ -1908,6 +1916,20 @@ async function editFactsSrc(){
 async function saveFactsSrc(){
   const r=await post('/api/facts/'+SLUG,{text:$('#factsrc').value});
   toast(r.ok?'已保存':'失败',r.ok?'':'err'); if(r.ok){closeModal();load(SLUG,true)}
+}
+// 无自有网站的项目：content/materials.md 取代官网正文，是推导的唯一底座。
+async function editMaterials(){
+  const f=await api('/api/content/'+SLUG+'?path=materials.md');
+  modal(`<h4 style="font-size:17px">介绍材料 · content/materials.md</h4>
+    <p class="muted" style="font-size:12px">没有官网时，这份材料取代官网正文，是推导品牌事实、竞品与问题库的唯一依据。保存后到「设置 → 运行任务」跑「自动引导」。</p>
+    <textarea id="matsrc" class="input" rows="20">${esc((f&&f.text)||'')}</textarea>
+    <div class="row" style="justify-content:flex-end;margin-top:12px">
+      <button class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveMaterials()">保存</button></div>`);
+}
+async function saveMaterials(){
+  const r=await post('/api/content/'+SLUG,{path:'materials.md',text:$('#matsrc').value});
+  toast(r.ok?'已保存':'失败：'+(r.error||''),r.ok?'':'err'); if(r.ok){closeModal();load(SLUG,true)}
 }
 
 /* ===================== 行动计划 ===================== */
@@ -2662,8 +2684,10 @@ async function vOnboard(){
           <span class="muted" style="font-size:11.5px">配好后回到这里继续</span></div>
       </div>`
       :`<div class="muted" style="font-size:12px">已配置引擎：国内 ${okCn} 个 · 海外 ${okGl} 个（可在「设置」增改）${(ST.obMkt||'both')!=='global'&&!okCn?'——注意国内市场尚无可用 Key':''}${(ST.obMkt||'both')!=='cn'&&!okGl?'——注意海外市场尚无可用 Key':''}</div>`}
-      <div class="field"><label>官网域名 *</label><input id="ob-url" class="input" placeholder="https://example.com" value="${esc(ST.obUrl||'')}"></div>
-      <div class="field"><label>品牌名称（留空自动从网页识别）</label><input id="ob-name" class="input" value="${esc(ST.obName||'')}"></div>
+      <label class="row" style="gap:6px;font-size:13px"><input type="checkbox" id="ob-nosite" style="width:auto" ${ST.obNoSite?'checked':''} onchange="obToggleSite()"> 没有官方网站（电商商品 / 线下品牌 / 小程序）</label>
+      ${ST.obNoSite?'':`<div class="field"><label>官网域名 *</label><input id="ob-url" class="input" placeholder="https://example.com" value="${esc(ST.obUrl||'')}"></div>`}
+      <div class="field"><label>${ST.obNoSite?'品牌 / 商品名称 *':'品牌名称（留空自动从网页识别）'}</label><input id="ob-name" class="input" value="${esc(ST.obName||'')}"></div>
+      ${ST.obNoSite?'<div class="muted" style="font-size:12px;line-height:1.6">没有官网也能做 GEO：抓取、站点体检、站内资产这三步不适用，采样、竞品、阵地、内容、验收全部照常。创建后先到「品牌事实库 → 编辑介绍材料」写清它是什么、卖点与竞品——那份材料取代官网正文，是推导问题库与品牌事实的唯一依据。</div>':''}
       <div class="field"><label>目标市场</label><div class="seg">
         ${[['cn','国内引擎'],['global','海外引擎'],['both','两者都要']].map(([m,l])=>`<label class="seg-opt"><input type="radio" name="obm" value="${m}" ${(ST.obMkt||'both')===m?'checked':''}>${l}</label>`).join('')}</div></div>
       <label class="row" style="gap:6px;font-size:13px"><input type="checkbox" id="ob-nosample" style="width:auto" ${ST.obNoSample?'checked':''}> 首期跳过采样（省时间，可稍后补）</label>
@@ -2697,10 +2721,21 @@ async function vOnboard(){
     ${body}
   </div></div>`;
 }
+function obToggleSite(){
+  const u=$('#ob-url');if(u)ST.obUrl=u.value.trim();
+  ST.obName=$('#ob-name').value.trim();
+  ST.obMkt=document.querySelector('input[name=obm]:checked').value;
+  ST.obNoSample=$('#ob-nosample').checked;
+  ST.obNoSite=$('#ob-nosite').checked;
+  render();
+}
 async function obCreate(){
-  const url=$('#ob-url').value.trim();
-  if(!url){toast('请填写官网地址','err');return}
-  ST.obUrl=url;ST.obName=$('#ob-name').value.trim();
+  ST.obNoSite=$('#ob-nosite').checked;
+  const url=ST.obNoSite?'':$('#ob-url').value.trim();
+  ST.obName=$('#ob-name').value.trim();
+  if(!ST.obNoSite&&!url){toast('请填写官网地址，或勾选「没有官方网站」','err');return}
+  if(ST.obNoSite&&!ST.obName){toast('没有官网就没法自动识别名字——请填品牌/商品名称','err');return}
+  ST.obUrl=url;
   ST.obMkt=document.querySelector('input[name=obm]:checked').value;
   // 没配任何引擎 Key：明确告知会缺什么,让用户选择继续或先去配置
   const okKeys=(KEYS||[]).filter(k=>k.ok===true);
@@ -2711,11 +2746,20 @@ async function obCreate(){
   if(okKeys.length&&miss.length&&!confirm(`所选市场里 ${miss.map(m=>m==='cn'?'国内':'海外').join('、')} 尚无已配置的引擎 Key，该市场的自动采样会被跳过（可稍后补 Key 或用人工采样表）。\n\n仍要继续吗？`))
     {go('settings');return}
   ST.obNoSample=$('#ob-nosample').checked;
-  const r=await post('/api/init',{url,name:ST.obName,
+  const r=await post('/api/init',{url,name:ST.obName,no_site:ST.obNoSite,
     market:ST.obMkt,max_pages:25});
   if(!r.ok){toast(r.error||'创建失败','err');return}
   ST.obSlug=r.slug;KEYS=null;PROJECTS=null;
   await load(r.slug,true);
+  if(r.no_site){
+    // 无自有网站：没有官网正文可抓，先让人写完介绍材料再跑引导，
+    // 否则 bootstrap 只能对着空材料推导。
+    ST.obStep=1;ST.obFail=false;
+    go('facts');
+    editMaterials();
+    toast('项目已创建。写完介绍材料后，到「设置 → 运行任务」跑自动引导');
+    return;
+  }
   ST.obStep=2;ST.obFail=false;R='onboard';render();
   const p=ST.obNoSample?{'--no-sample':true}:{};
   const job=await runAction('autopilot',p);

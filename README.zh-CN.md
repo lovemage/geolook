@@ -109,7 +109,7 @@
 
 - macOS 或 Linux（Windows 请用 WSL；代码用了 `fcntl` 文件锁）
 - Python **3.9+**
-- 唯三的第三方依赖：`requests`、`beautifulsoup4`、`lxml`
+- 四个第三方依赖：`requests`、`beautifulsoup4`、`lxml`、`opencc-python-reimplemented`
 
 ### 三步跑起来
 
@@ -117,10 +117,10 @@
 # 1. 克隆并安装依赖
 git clone https://github.com/aigclink/geolook.git
 cd geolook
-pip3 install requests beautifulsoup4 lxml
+pip3 install -r requirements.txt
 
 # 2. 启动看板（自动打开浏览器）
-python3 scripts/geo.py ui        # → http://127.0.0.1:8765
+python3 scripts/geo.py ui --host 127.0.0.1  # → http://127.0.0.1:8765
 #    macOS 可注册为常驻服务：./scripts/service.sh install
 #   （登录自启、崩溃自动拉起、关终端不停）
 
@@ -131,9 +131,11 @@ python3 scripts/geo.py ui        # → http://127.0.0.1:8765
 
 **一个 Key 都不配也能用**：自动采样会跳过，改用「导出人工采样表 → 人工/浏览器采样 → 回灌」的流程；抓站、体检、工单、资产等功能不依赖任何 Key。配一个国内引擎 Key（如 DeepSeek/GLM）即可解锁「自动推导问题库/品牌事实」和「AI 初稿」。
 
+**中文规范化**：抓取时优先请求台湾繁体，区分 `zh-Hans` 与 `zh-Hant`，并保留原文、OpenCC `s2twp` 规范化版本及置信度元数据。代码区块、行内代码、JSON 键及网址保持原样。可在 `.env` 通过 `GEO_ACCEPT_LANGUAGE` 覆写抓取偏好。
+
 ### 服务器/远程部署
 
-服务默认只绑定 `127.0.0.1`。要远程访问，两种方式：
+服務優先使用目前的 Tailscale IPv4，無法取得時回退 `127.0.0.1`。使用 Tailscale 或其他非本機位址前，必須設定 `GEOLOOK_TOKEN`，否則拒絕啟動。位址優先順序：`--host` → `GEOLOOK_HOST` → 自動偵測。僅本機使用請執行 `python3 scripts/geo.py ui --host 127.0.0.1`。遠端存取方式：
 
 ```bash
 # 方式 A（推荐）：SSH 隧道，不暴露任何端口
@@ -147,6 +149,8 @@ python3 scripts/geo.py ui
 # 浏览器首次访问输入令牌（或打开 http://server:8765/?token=令牌），
 # 之后凭 HttpOnly cookie 访问；API 调用带 X-Geolook-Token 头
 ```
+
+寫入端點（所有 `POST /api/…`）另有一層與權杖無關的防線：只接受 `Content-Type: application/json`、拒絕跨來源的 `Origin`、拒絕既非 IP 字面量、`localhost` 也非 `*.ts.net` 的 `Host`。你剛好開著的某個網頁因此指揮不動看板，rebinding 網域也冒充不了它。若要用自有網域存取看板，把網域列進 `GEOLOOK_ALLOWED_HOSTS`（逗號分隔）。
 
 公网部署建议再套一层 HTTPS 反向代理（nginx/caddy），令牌走明文 HTTP 会被中间人看到。`.env` 与 `work/` 含密钥和项目数据，注意文件权限。
 
@@ -192,6 +196,9 @@ python3 scripts/geo.py new --url https://example.com --market both
 ```bash
 python3 scripts/geo.py init --no-site --name "商品名" --materials 介绍材料.md --market cn
 ```
+
+看板入口：接入引导第 1 步勾选**「没有官方网站」**，填品牌/商品名称即可（不填网址）。
+建好后直接进「品牌事实库 → 编辑介绍材料」，不会去抓站。
 
 介绍材料取代官网正文，成为品牌事实、竞品与问题库的推导底座（不给 `--materials`
 会生成模板让你填）。差异只有三处：抓取/体检自动跳过、llms.txt 与 JSON-LD 不产出
@@ -247,7 +254,7 @@ python3 scripts/geo.py sample-import --slug <项目> --file <采样表>
 
 ## 设计原则与安全边界
 
-- **单机自托管**：标准库 `http.server` 只绑 127.0.0.1；无数据库无账号，数据即文件
+- **单机自托管**：标准库 `http.server` 默认绑定 Tailscale IPv4（无法取得时回退本机）；无数据库无账号，数据即文件
 - **宁缺毋滥**：品牌事实只从官网正文抽取，抽不到标「待确认」；竞品严禁发明名字；AI 初稿必须过 lint 并人工核实
 - **验收即产品**：能自动判定的绝不靠人回填
 - **发布永远手动**：渠道凭证在本地 `.env`（权限 600），每次发布人工点击确认；公众号/WordPress 只进草稿箱

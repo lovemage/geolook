@@ -37,9 +37,25 @@ class DocumentLangCase(unittest.TestCase):
         self.assertIsNotNone(target)
         self.assertEqual(len(source.group(1)), len(target.group(1)))
 
+    def test_traditional_dynamic_text_conversion_skips_code(self):
+        self.assertIn("root.parentElement.closest('pre,code,script,style,textarea')", self.html)
+        self.assertIn("if(ULANG==='zh-tw'){root.nodeValue=toZhTW(root.nodeValue);return}", self.html)
+        self.assertIn("else if(ULANG==='zh-tw')el.setAttribute(a,toZhTW(v))", self.html)
+
     def test_generated_document_links_use_traditional_filenames(self):
         self.assertIn("3-GEO執行方案.html", self.html)
         self.assertIn("03-工單表.csv", self.html)
+
+    def test_onboarding_offers_a_no_site_path(self):
+        """无自有网站的品牌要能从网页入口建项目（review 0920 · findings 4）。"""
+        self.assertIn('id="ob-nosite"', self.html)
+        self.assertIn("no_site:ST.obNoSite", self.html)
+        self.assertIn("没有官方网站（电商商品 / 线下品牌 / 小程序）", self.html)
+
+    def test_no_site_projects_can_edit_materials(self):
+        self.assertIn("async function editMaterials()", self.html)
+        self.assertIn("/api/content/'+SLUG+'?path=materials.md", self.html)
+        self.assertIn("path:'materials.md'", self.html)
 
     def test_shutdown_button_requires_confirmation_and_posts(self):
         self.assertIn('onclick="shutdownServer()"', self.html)

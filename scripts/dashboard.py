@@ -12,22 +12,25 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import subprocess
 import threading
 import time
 import webbrowser
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     import geolib as G
 except ModuleNotFoundError as e:
-    raise SystemExit(f"缺少依赖：{e.name}。请先 pip3 install requests beautifulsoup4 lxml") from e
+    raise SystemExit(f"缺少依赖：{e.name}。请先 pip3 install -r requirements.txt") from e
 import jobs as J
 import tasks as T
 
@@ -222,13 +225,16 @@ def write_env(updates: dict[str, str]):
         pass
 
 
-def create_project(url: str, name: str, slug: str, market: str, max_pages: int) -> dict:
+def create_project(url: str, name: str, slug: str, market: str, max_pages: int,
+                   no_site: bool = False) -> dict:
     import geo as CLI
 
     class A:  # 复用 CLI 的 init 逻辑，避免两份实现漂移
         pass
     a = A()
     a.url, a.name, a.slug, a.market, a.max_pages = url, name or None, slug or None, market, max_pages
+    a.no_site = no_site      # 无自有网站的商品/品牌：界面入口与 CLI --no-site 同一条路径
+    a.materials = ""
     a.force = False          # 界面永不覆盖已有项目
     return CLI.cmd_init(a)
 
@@ -261,6 +267,61 @@ def auth_ok(token: str | None, cookie_header: str | None,
     return False
 
 
+# ---------------------------------------------------------------- 写入请求来源
+# 「没设令牌」不等于「谁都能写」：浏览器里任何网页都能向 127.0.0.1 发跨源请求。
+# 写入端点因此另外守三道，三道都不依赖令牌是否启用：
+#   1. Content-Type 必须是 application/json——表单/text-plain 这类「简单请求」发不出
+#      这个头，浏览器会先发预检，而本服务不回 CORS 头，预检直接失败；
+#   2. 带 Origin 时必须与 Host 同源，或来自浏览器扩展（chrome-extension:// 等，
+#      网页伪造不了这个 Origin）；没有 Origin 的本机脚本（curl / CLI）照常放行；
+#   3. Host 对照允许清单，挡 DNS rebinding——攻击者把自己的域名解析到 127.0.0.1 后，
+#      Origin 与 Host 会一致，第 2 道就拦不住了。
+
+EXTENSION_ORIGIN_SCHEMES = frozenset({
+    "chrome-extension", "moz-extension", "safari-web-extension", "extension"})
+# 本机自用的默认名字；其余靠「IP 字面量」与「*.ts.net」两条规则覆盖。
+DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _host_name(host_header: str | None) -> str:
+    """取 Host 头里的主机名：去掉端口，IPv6 去掉方括号。"""
+    v = (host_header or "").strip().lower()
+    if not v:
+        return ""
+    if v.startswith("["):
+        return v[1:v.index("]")] if "]" in v else v[1:]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+def host_allowed(host_header: str | None, allowed=DEFAULT_ALLOWED_HOSTS) -> bool:
+    """纯函数便于测试。IP 字面量与 Tailscale MagicDNS（*.ts.net）放行——
+    前者不可能被 rebinding 利用，后者只在 tailnet 内解析。其余域名须显式列入
+    GEOLOOK_ALLOWED_HOSTS。"""
+    name = _host_name(host_header)
+    if not name:
+        return False
+    if name in allowed or name.endswith(".ts.net"):
+        return True
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
+
+def write_origin_ok(origin: str | None, host_header: str | None) -> bool:
+    """写入请求的来源判定：同源放行、浏览器扩展放行、无 Origin 放行，其余拒绝。"""
+    o = (origin or "").strip()
+    if not o:
+        return True                       # curl / CLI / 本机脚本：浏览器才发 Origin
+    if o.lower() == "null":
+        return False                      # sandbox iframe、file:// —— 无法归因，拒绝
+    u = urlparse(o)
+    if u.scheme.lower() in EXTENSION_ORIGIN_SCHEMES:
+        return True
+    return bool(host_header) and u.netloc.lower() == (host_header or "").strip().lower()
+
+
 _LOGIN_HTML = """<!doctype html><meta charset="utf-8"><title>GeoLook</title>
 <body style="background:#131622;color:#e8eaf2;font-family:system-ui;display:flex;
 align-items:center;justify-content:center;height:100vh;margin:0">
@@ -278,6 +339,7 @@ padding:10px 18px;font-size:14px;margin-left:8px;cursor:pointer">进入</button>
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     TOKEN: str | None = None  # run() 注入；None = 不启用认证
+    ALLOWED_HOSTS: frozenset[str] = DEFAULT_ALLOWED_HOSTS  # run() 注入
 
     def log_message(self, *a):  # 静音访问日志
         pass
@@ -303,7 +365,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET":
             self._send(401, _LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
         else:
-            self._json({"error": "未授权：需要 X-Geolook-Token 头或先在浏览器登录"}, 401)
+            self._reject(401, "未授权：需要 X-Geolook-Token 头或先在浏览器登录")
         return False
 
     def _send(self, code, body: bytes, ctype="application/json; charset=utf-8"):
@@ -316,6 +378,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _reject(self, code: int, msg: str):
+        """拒绝写入：不读 body，回完就断开。
+
+        HTTP/1.1 是 keep-alive 的，请求体不读完就响应的话，剩下的字节会被当成
+        下一个请求来解析。写入端点在读 body 之前就可能拒绝，所以这里直接收线。"""
+        body = json.dumps({"ok": False, "error": msg}, ensure_ascii=False).encode("utf-8")
+        self.close_connection = True
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _write_guard(self) -> bool:
+        """写入前的来源检查。True=放行；False=已自行响应。"""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._reject(415, "写入接口只接受 Content-Type: application/json")
+            return False
+        host = self.headers.get("Host")
+        if not host_allowed(host, Handler.ALLOWED_HOSTS):
+            self._reject(403, f"Host `{host}` 不在允许清单内；"
+                              "确需用域名访问请设 GEOLOOK_ALLOWED_HOSTS")
+            return False
+        if not write_origin_ok(self.headers.get("Origin"), host):
+            self._reject(403, "跨来源写入已拒绝：请从看板页面或已授权的采样扩展发起")
+            return False
+        return True
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length", 0))
@@ -505,6 +598,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth():
             return
+        if not self._write_guard():
+            return
         p = unquote(urlparse(self.path).path)
         try:
             body = self._body()
@@ -524,12 +619,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "task": t})
 
             if p == "/api/init":
+                # 无自有网站的商品/品牌（电商、线下、小程序）同样能做 GEO：
+                # 抓取/体检/站内资产不适用，其余流程照常，判据只看 brand.site 是否为空。
                 url = (body.get("url") or "").strip()
-                if not url:
-                    return self._json({"ok": False, "error": "请填写官网地址"}, 400)
-                cfg = create_project(url, body.get("name", ""), body.get("slug", ""),
-                                     body.get("market", "cn"), int(body.get("max_pages", 25)))
-                return self._json({"ok": True, "slug": cfg["slug"]})
+                name = (body.get("name") or "").strip()
+                no_site = bool(body.get("no_site"))
+                if no_site:
+                    if url:
+                        return self._json({"ok": False,
+                                           "error": "已选「没有官方网站」：请清空网址，或取消勾选"}, 400)
+                    if not name:
+                        return self._json({"ok": False,
+                                           "error": "没有官网就没法自动识别名字——请填品牌/商品名称"}, 400)
+                elif not url:
+                    return self._json({"ok": False,
+                                       "error": "请填写官网地址；没有官网就勾选「没有官方网站」"}, 400)
+                cfg = create_project(url, name, body.get("slug", ""),
+                                     body.get("market", "cn"), int(body.get("max_pages", 25)),
+                                     no_site=no_site)
+                return self._json({"ok": True, "slug": cfg["slug"],
+                                   "no_site": not G.has_site(cfg)})
 
             if p == "/api/run":
                 job = J.start(body["slug"], body["action"], body.get("params") or {})
@@ -578,9 +687,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if p.startswith("/api/config/"):
                 slug = p[len("/api/config/"):]
-                cur = G.read_json(G.project_dir(slug) / "geo.json", {})
-                cur.update(body)          # 整体覆盖字段，前端传完整对象
-                G.save_config(slug, cur)
+                with G.project_lock(slug):   # 读改写：两个请求并发会丢掉其中一方的改动
+                    cur = G.read_json(G.project_dir(slug) / "geo.json", {})
+                    cur.update(body)      # 整体覆盖字段，前端传完整对象
+                    G.save_config(slug, cur)
                 return self._json({"ok": True})
 
             if p.startswith("/api/facts/"):
@@ -657,11 +767,12 @@ class Handler(BaseHTTPRequestHandler):
                 if code not in P.PUBLISHERS:
                     return self._json({"ok": False, "error": f"未知渠道 {code}"}, 400)
                 keys = {k for k, _ in P.PUBLISHERS[code]["cfg"]}
-                cfg = G.read_json(G.project_dir(slug) / "geo.json", {})
-                pub = cfg.setdefault("publishing", {})
-                pub[code] = {k: str(v or "").strip() for k, v in (body.get("cfg") or {}).items()
-                             if k in keys}
-                G.save_config(slug, cfg)
+                with G.project_lock(slug):   # 读改写：同时配两个渠道会互相覆盖
+                    cfg = G.read_json(G.project_dir(slug) / "geo.json", {})
+                    pub = cfg.setdefault("publishing", {})
+                    pub[code] = {k: str(v or "").strip()
+                                 for k, v in (body.get("cfg") or {}).items() if k in keys}
+                    G.save_config(slug, cfg)
                 return self._json({"ok": True})
 
             if p.startswith("/api/publish/"):
@@ -679,14 +790,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not qid or not ch:
                     return self._json({"ok": False, "error": "缺 qid / channel"}, 400)
                 path = G.project_dir(slug) / "distribution.json"
-                dist = G.read_json(path, {})
-                if body.get("on"):
-                    dist.setdefault(qid, {})[ch] = G.now_iso()
-                else:
-                    dist.get(qid, {}).pop(ch, None)
-                    if not dist.get(qid):
-                        dist.pop(qid, None)
-                G.write_json(path, dist)
+                with G.project_lock(slug):   # 读改写：并发打勾两个渠道会丢掉一笔
+                    dist = G.read_json(path, {})
+                    if body.get("on"):
+                        dist.setdefault(qid, {})[ch] = G.now_iso()
+                    else:
+                        dist.get(qid, {}).pop(ch, None)
+                        if not dist.get(qid):
+                            dist.pop(qid, None)
+                    G.write_json(path, dist)
                 return self._json({"ok": True, "distribution": dist})
 
             if p == "/api/questions-add":
@@ -694,30 +806,31 @@ class Handler(BaseHTTPRequestHandler):
                 items = body.get("items")
                 if not slug or not isinstance(items, list) or not items:
                     return self._json({"ok": False, "error": "缺 slug / items"}, 400)
-                cfg = G.read_json(G.project_dir(slug) / "geo.json", {})
-                qs = cfg.setdefault("questions", [])
-                existing = {q.get("text", "").strip() for q in qs}
-                series = {"cn": 1, "global": 101, "both": 901}
-                used = {int(m.group(1)) for q in qs
-                        if (m := re.match(r"q(\d+)$", str(q.get("id", ""))))}
-                added = []
-                for it in items:
-                    text = str(it.get("text") or "").strip()
-                    mk = it.get("market") if it.get("market") in series else "cn"
-                    grp = str(it.get("group") or "场景").strip() or "场景"
-                    if not text or text in existing:
-                        continue
-                    n = series[mk]
-                    while n in used:
-                        n += 1
-                    used.add(n)
-                    q = {"id": f"q{n:03d}", "group": grp, "market": mk, "text": text,
-                         "source": "expand"}
-                    qs.append(q)
-                    existing.add(text)
-                    added.append(q)
-                if added:
-                    G.save_config(slug, cfg)
+                with G.project_lock(slug):   # 读改写：并发追加会丢题，也会撞出重复 id
+                    cfg = G.read_json(G.project_dir(slug) / "geo.json", {})
+                    qs = cfg.setdefault("questions", [])
+                    existing = {q.get("text", "").strip() for q in qs}
+                    series = {"cn": 1, "global": 101, "both": 901}
+                    used = {int(m.group(1)) for q in qs
+                            if (m := re.match(r"q(\d+)$", str(q.get("id", ""))))}
+                    added = []
+                    for it in items:
+                        text = str(it.get("text") or "").strip()
+                        mk = it.get("market") if it.get("market") in series else "cn"
+                        grp = str(it.get("group") or "场景").strip() or "场景"
+                        if not text or text in existing:
+                            continue
+                        n = series[mk]
+                        while n in used:
+                            n += 1
+                        used.add(n)
+                        q = {"id": f"q{n:03d}", "group": grp, "market": mk, "text": text,
+                             "source": "expand"}
+                        qs.append(q)
+                        existing.add(text)
+                        added.append(q)
+                    if added:
+                        G.save_config(slug, cfg)
                 return self._json({"ok": True, "added": len(added),
                                    "ids": [q["id"] for q in added]})
 
@@ -773,14 +886,51 @@ def _monitor_loop():
         time.sleep(1800)
 
 
+def _resolve_host(host: Optional[str] = None) -> str:
+    """Prefer the current Tailscale IPv4, with a localhost fallback."""
+    if host:
+        return host
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return "127.0.0.1"
+    if result.returncode != 0:
+        return "127.0.0.1"
+    candidate = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return "127.0.0.1"
+    return candidate if isinstance(address, ipaddress.IPv4Address) else "127.0.0.1"
+
+
+def _allowed_hosts(host: str) -> frozenset[str]:
+    """写入请求允许的 Host 名。IP 字面量与 *.ts.net 由 host_allowed() 另行放行，
+    这里只收默认名、实际绑定地址，以及 GEOLOOK_ALLOWED_HOSTS 里额外声明的域名。"""
+    names = set(DEFAULT_ALLOWED_HOSTS)
+    if host and host != "0.0.0.0":
+        names.add(host.strip().lower())
+    for extra in (os.environ.get("GEOLOOK_ALLOWED_HOSTS") or "").split(","):
+        if extra.strip():
+            names.add(extra.strip().lower())
+    return frozenset(names)
+
+
 def run(port: int = 8765, open_browser: bool = True,
         host: str | None = None, token: str | None = None):
-    host = host or os.environ.get("GEOLOOK_HOST") or "127.0.0.1"
+    host = _resolve_host(host or os.environ.get("GEOLOOK_HOST"))
     token = token or os.environ.get("GEOLOOK_TOKEN") or None
     if host not in ("127.0.0.1", "localhost") and not token:
         G.die(f"绑定到 {host} 会把看板暴露给网络上的所有人。"
               "先设置访问令牌再启动：export GEOLOOK_TOKEN=$(openssl rand -hex 16)")
     Handler.TOKEN = token
+    Handler.ALLOWED_HOSTS = _allowed_hosts(host)
     J.reap_orphans()  # 回收上次服务留下的 running 僵尸记录，恢复并发保护
     threading.Thread(target=_monitor_loop, daemon=True).start()
     srv = ThreadingHTTPServer((host, port), Handler)

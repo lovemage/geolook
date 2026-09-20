@@ -1,4 +1,4 @@
-import json, tempfile, unittest
+import json, tempfile, threading, unittest
 from pathlib import Path
 import sys; sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 import geolib as G
@@ -6,7 +6,7 @@ import geolib as G
 class TestJsonIO(unittest.TestCase):
     def test_traditional_chinese_document_output(self):
         source = "诊断报告：当前项目支持导出文件，运行后打开链接。"
-        expected = "診斷報告：目前專案支援匯出檔案，執行後打開連結。"
+        expected = "診斷報告：目前專案支援匯出檔案，執行後開啟連結。"
         self.assertEqual(G.to_zh_tw(source), expected)
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "report.md"
@@ -14,12 +14,84 @@ class TestJsonIO(unittest.TestCase):
             self.assertEqual(p.read_text("utf-8"), expected)
             self.assertFalse(list(Path(d).glob("*.tmp")))
 
+    def test_traditional_conversion_preserves_code_and_urls(self):
+        source = (
+            "运行下面代码：`print('简体代码')`\n"
+            "```python\n标签 = '简体代码'\n```\n"
+            "访问 https://example.com/简体路径。继续运行。"
+        )
+        converted = G.to_zh_tw(source)
+        self.assertIn("執行下面程式碼", converted)
+        self.assertIn("`print('简体代码')`", converted)
+        self.assertIn("标签 = '简体代码'", converted)
+        self.assertIn("https://example.com/简体路径", converted)
+        self.assertIn("。繼續執行。", converted)
+
+    def test_json_document_preserves_keys_and_normalizes_values(self):
+        source = json.dumps({"简体键": "当前项目", "nested": ["打开链接"]}, ensure_ascii=False)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "asset.json"
+            G.write_document(p, source)
+            payload = json.loads(p.read_text("utf-8"))
+        self.assertIn("简体键", payload)
+        self.assertEqual(payload["简体键"], "目前專案")
+        self.assertEqual(payload["nested"], ["開啟連結"])
+
     def test_write_json_atomic(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "x.json"
             G.write_json(p, {"a": 1})
             self.assertEqual(G.read_json(p), {"a": 1})
             self.assertFalse(list(Path(d).glob("*.tmp")))
+
+    def test_concurrent_writers_in_one_process(self):
+        """看板是 ThreadingHTTPServer：同 PID 的两个线程写同一个文件不能互相踩。
+
+        暂存文件名曾用 PID 拼，两个线程会撞同一个路径——先完成的那个把它 rename
+        走，另一个撞 FileNotFoundError（review 0920 · findings 1）。"""
+        for writer in (G.write_json, lambda p2, v: G.write_document(p2, json.dumps(v))):
+            with tempfile.TemporaryDirectory() as d:
+                target = Path(d) / "shared.json"
+                start = threading.Barrier(8)
+                errors = []
+
+                def run(i):
+                    start.wait()
+                    try:
+                        writer(target, {"writer": i})
+                    except Exception as e:      # noqa: BLE001 —— 要的就是它不该发生
+                        errors.append(e)
+
+                threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                self.assertEqual(errors, [], f"{writer} 并发写出错")
+                self.assertIn("writer", G.read_json(target, {}))
+                self.assertEqual(list(Path(d).iterdir()), [target])
+
+    def test_jsonld_fact_fields_survive_traditional_conversion(self):
+        """JSON-LD 的身分字段是品牌事实，不是文案：转换会把它改写成另一个牌子
+        （review 0920 · findings 5）。"""
+        payload = {
+            "@type": "Organization",
+            "name": "软件工厂",
+            "alternateName": ["软件工厂科技", "Software Factory"],
+            "url": "https://example.com/产品",
+            "description": "面向当前项目的数据网络服务。",
+            "parentOrganization": {"@type": "Organization", "name": "网络集团"},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            p2 = Path(d) / "organization.json"
+            G.write_document(p2, json.dumps(payload, ensure_ascii=False),
+                             json_translate_keys=G.JSONLD_TRANSLATABLE_KEYS)
+            out = json.loads(p2.read_text("utf-8"))
+        self.assertEqual(out["name"], "软件工厂")
+        self.assertEqual(out["alternateName"], ["软件工厂科技", "Software Factory"])
+        self.assertEqual(out["url"], "https://example.com/产品")
+        self.assertEqual(out["parentOrganization"]["name"], "网络集团")
+        self.assertEqual(out["description"], "面向目前專案的資料網路服務。")
 
     def test_read_json_corrupt_returns_default(self):
         with tempfile.TemporaryDirectory() as d:
@@ -74,6 +146,18 @@ class TestJsonIO(unittest.TestCase):
             # 前提确认：这些字符确实原样落盘了，否则本测试没有鉴别力
             self.assertIn("\u2028", p.read_text("utf-8"))
             self.assertEqual(G.read_jsonl(p), rows)
+    def test_main_text_marks_code_boundaries(self):
+        soup = G.parse_html(
+            "<main><p>运行示例</p><pre><code>标签 = '简体代码'</code></pre>"
+            "<p>使用 <code>简体变量</code> 完成</p></main>"
+        )
+        text = G.main_text(soup)
+        self.assertIn("```text\n标签 = '简体代码'\n```", text)
+        self.assertIn("`简体变量`", text)
+        converted = G.to_zh_tw(text)
+        self.assertIn("執行示例", converted)
+        self.assertIn("标签 = '简体代码'", converted)
+        self.assertIn("`简体变量`", converted)
 
     def test_project_lock_enter_exit(self):
         with tempfile.TemporaryDirectory() as d:

@@ -26,11 +26,47 @@ const store = {
 
 function serverUrl() { return $("#server").value.trim().replace(/\/$/, "") || "http://127.0.0.1:8765"; }
 function slug() { return $("#slug").value; }
+function token() { return ($("#token").value || "").trim(); }
 
-async function apiGet(path) {
-  const r = await fetch(serverUrl() + path);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
+/* 看板可以开访问令牌（GEOLOOK_TOKEN）。开了之后每个请求都要带 X-Geolook-Token，
+   否则一律 401——所以读写都走同一个包装，别再各写各的 fetch。
+   403 的常见原因是 Host/来源不被接受（改了端口、用域名访问、扩展没授权）。*/
+async function apiFetch(path, init) {
+  const opt = Object.assign({}, init);
+  opt.headers = Object.assign({}, (init || {}).headers);
+  const t = token();
+  if (t) opt.headers["X-Geolook-Token"] = t;
+  const r = await fetch(serverUrl() + path, opt);
+  if (r.status === 401)
+    throw new Error("看板开了访问令牌——把 GEOLOOK_TOKEN 填进上面的「访问令牌」再试");
+  if (r.status === 403)
+    throw new Error("看板拒绝了这个来源——确认扩展已获该地址的授权，且地址与看板实际地址一致");
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new Error((j && j.error) || `HTTP ${r.status}`);
+  return j;
+}
+
+const apiGet = (path) => apiFetch(path);
+const apiPost = (path, body) => apiFetch(path, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+/* manifest 只固定授权 127.0.0.1:8765 / localhost:8765。换端口或走 Tailscale 地址时，
+   host 权限得由用户在点击里临时授权——chrome.permissions.request 必须由手势触发。*/
+async function ensureAccess() {
+  let origin;
+  try { origin = new URL(serverUrl()).origin + "/*"; }
+  catch (e) { return { ok: false, error: "服务器地址不是合法 URL" }; }
+  try {
+    if (await chrome.permissions.contains({ origins: [origin] })) return { ok: true };
+    const granted = await chrome.permissions.request({ origins: [origin] });
+    return granted ? { ok: true }
+                   : { ok: false, error: `没有 ${origin} 的访问授权——浏览器弹窗里点「允许」` };
+  } catch (e) {
+    return { ok: false, error: "无法申请访问授权：" + e.message };
+  }
 }
 
 async function activeTab() {
@@ -114,7 +150,8 @@ async function loadProjects() {
     const saved = await store.get("slug");
     if (saved && ps.some(p => p.slug === saved)) $("#slug").value = saved;
   } catch (e) {
-    $("#qmeta").textContent = "连不上看板——先启动 geo.py ui";
+    $("#qmeta").textContent = e.message.startsWith("看板")
+      ? e.message : "连不上看板——先启动 geo.py ui（" + e.message + "）";
   }
 }
 
@@ -156,7 +193,14 @@ async function sendToTab(msg) {
   catch (e) { return { ok: false, error: "此页面没有采样脚本（站点不在支持列表，或需刷新页面）" }; }
 }
 
-$("#load").onclick = loadQueue;
+$("#load").onclick = async () => {
+  const acc = await ensureAccess();
+  if (!acc.ok) { $("#qmeta").textContent = acc.error; return; }
+  await store.set("server", serverUrl());
+  await store.set("token", token());
+  await loadProjects();
+  await loadQueue();
+};
 $("#platSel").onchange = renderQueue;
 $("#pickbuyer").onclick = async () => {
   GROUPS = (QUEUE.groups || []).filter(g => g.buyer).map(g => g.name);
@@ -308,18 +352,16 @@ $("#abort").onclick = () => { RUN = null; alog("已中止"); $("#auto").hidden =
 
 $("#upload").onclick = async () => {
   if (!SAMPLES.length) { $("#upmsg").textContent = "还没有已采集的样本"; return; }
+  const acc = await ensureAccess();
+  if (!acc.ok) { $("#upmsg").textContent = acc.error; return; }
   try {
-    const r = await fetch(`${serverUrl()}/api/collect/${slug()}`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: SAMPLES }),
-    });
-    const j = await r.json();
+    const j = await apiPost(`/api/collect/${slug()}`, { records: SAMPLES });
     if (j.ok) {
       $("#upmsg").textContent = `✓ 已导入 ${j.imported} 条（A 级人工样本），指标已重算`;
       SAMPLES = []; await store.set("samples:" + slug(), []);
       $("#count").textContent = "0"; renderQueue();
-    } else $("#upmsg").textContent = "导入失败：" + (j.error || r.status);
-  } catch (e) { $("#upmsg").textContent = "连不上看板：" + e.message; }
+    } else $("#upmsg").textContent = "导入失败：" + (j.error || "未知原因");
+  } catch (e) { $("#upmsg").textContent = "上传失败：" + e.message; }
 };
 
 $("#export").onclick = () => {
@@ -346,6 +388,10 @@ $("#session").onchange = async () => {
 };
 
 (async () => {
+  $("#server").value = await store.get("server", "http://127.0.0.1:8765");
+  $("#token").value = await store.get("token", "");
+  $("#server").onchange = async () => { await store.set("server", serverUrl()); await loadProjects(); };
+  $("#token").onchange = async () => { await store.set("token", token()); await loadProjects(); };
   await loadProjects();
   $("#session").value = await store.get("session", "sandbox");
   GROUPS = await store.get("groups", []);
