@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -86,6 +88,30 @@ def project(slug: str) -> dict:
 
     lint = G.read_json(pdir / "assets" / "drafts" / "_lint.json", None)
 
+    # 成稿发布状态：content/ 里的每篇成稿 ↔ publish.json 的成功记录。
+    # 行动计划页的「成稿发布」卡和问题库的「已发布」标记都吃这份数据。
+    content_pub = []
+    cdir = pdir / "content"
+    if cdir.exists():
+        import re as _re
+        pub_by_path: dict[str, list] = {}
+        for r in G.read_json(pdir / "publish.json", []) or []:
+            if r.get("ok"):
+                pub_by_path.setdefault(r.get("path", ""), []).append(
+                    {"platform": r.get("platform"), "platform_name": r.get("platform_name"),
+                     "url": r.get("url", ""), "at": r.get("at", "")})
+        for f in sorted(cdir.glob("*.md")):
+            if f.name == "facts.md":
+                continue
+            head = f.read_text("utf-8", "replace")[:800]
+            m = _re.search(r"(?m)^#\s*(.+)$", head)
+            content_pub.append({
+                "path": f.name,
+                "title": (m.group(1).strip() if m else f.name)[:80],
+                "qids": _re.findall(r"\bq\d{3}\b", head),
+                "published": pub_by_path.get(f"content/{f.name}", []),
+            })
+
     return {
         "slug": slug,
         "brand": cfg.get("brand", {}),
@@ -94,12 +120,14 @@ def project(slug: str) -> dict:
                   "grade_distribution": audit.get("grade_distribution", {}),
                   "language_coverage": audit.get("language_coverage", {}),
                   "site": audit.get("site", {}), "site_issues": audit.get("site_issues", []),
+                  "layers": audit.get("layers", []),
                   "block_gap": audit.get("block_gap", []),
                   "pages": sorted(audit.get("pages", []), key=lambda p: p["score"])[:40]},
         "tasks": td.get("tasks", []),
         "verify_history": verify_hist,
         "deliveries": deliveries,
         "lint": {"total": (lint or {}).get("total_issues", 0), "high": (lint or {}).get("high", 0)},
+        "content_pub": content_pub,
         "blueprint": G.read_json(pdir / "blueprint.json", None),
         "distribution": G.read_json(pdir / "distribution.json", {}),
         "question_count": len(cfg.get("questions", [])),
@@ -205,11 +233,78 @@ def create_project(url: str, name: str, slug: str, market: str, max_pages: int) 
     return CLI.cmd_init(a)
 
 
+# ---------------------------------------------------------------- 访问令牌
+# 看板默认只绑 127.0.0.1；要暴露到公网（GEOLOOK_HOST=0.0.0.0）必须设 GEOLOOK_TOKEN。
+# 浏览器首次带 ?token= 访问后种 HttpOnly cookie（存摘要不存原文），之后正常访问；
+# API 调用也可带 X-Geolook-Token 头。
+
+AUTH_COOKIE = "glk_auth"
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def auth_ok(token: str | None, cookie_header: str | None,
+            query_token: str | None = None, header_token: str | None = None) -> bool:
+    """纯函数便于测试：任一凭证匹配即放行；未设 token 时全部放行。"""
+    if not token:
+        return True
+    for cand in (query_token, header_token):
+        if cand and hmac.compare_digest(cand, token):
+            return True
+    digest = _token_digest(token)
+    for part in (cookie_header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == AUTH_COOKIE and v and hmac.compare_digest(v, digest):
+            return True
+    return False
+
+
+_LOGIN_HTML = """<!doctype html><meta charset="utf-8"><title>GeoLook</title>
+<body style="background:#131622;color:#e8eaf2;font-family:system-ui;display:flex;
+align-items:center;justify-content:center;height:100vh;margin:0">
+<form style="text-align:center" onsubmit="location='/?token='+encodeURIComponent(
+document.getElementById('t').value);return false">
+<div style="font-size:20px;margin-bottom:14px">Geo<span style="color:#9184d9">Look</span></div>
+<input id="t" type="password" placeholder="访问令牌 / Access token" autofocus
+style="background:#1b1e2e;border:1px solid #3a3f55;border-radius:8px;color:#e8eaf2;
+padding:10px 14px;font-size:14px;width:240px">
+<button style="background:#9184d9;border:0;border-radius:8px;color:#101223;
+padding:10px 18px;font-size:14px;margin-left:8px;cursor:pointer">进入</button>
+</form></body>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    TOKEN: str | None = None  # run() 注入；None = 不启用认证
 
     def log_message(self, *a):  # 静音访问日志
         pass
+
+    def _auth(self) -> bool:
+        """True=放行；False=已自行响应（401 或换 cookie 的 302）。"""
+        if not Handler.TOKEN:
+            return True
+        u = urlparse(self.path)
+        qt = (parse_qs(u.query).get("token") or [None])[0]
+        if qt and hmac.compare_digest(qt, Handler.TOKEN):
+            # 令牌换 cookie 后跳回干净地址，别让令牌留在地址栏和访问日志里
+            self.send_response(302)
+            self.send_header("Location", u.path or "/")
+            self.send_header("Set-Cookie", f"{AUTH_COOKIE}={_token_digest(Handler.TOKEN)}; "
+                                           "HttpOnly; SameSite=Strict; Path=/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+        if auth_ok(Handler.TOKEN, self.headers.get("Cookie"),
+                   header_token=self.headers.get("X-Geolook-Token")):
+            return True
+        if self.command == "GET":
+            self._send(401, _LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        else:
+            self._json({"error": "未授权：需要 X-Geolook-Token 头或先在浏览器登录"}, 401)
+        return False
 
     def _send(self, code, body: bytes, ctype="application/json; charset=utf-8"):
         self.send_response(code)
@@ -228,6 +323,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ GET
     def do_GET(self):
+        if not self._auth():
+            return
         u = urlparse(self.path)
         p, q = unquote(u.path), parse_qs(u.query)
         try:
@@ -255,6 +352,50 @@ class Handler(BaseHTTPRequestHandler):
             if p.startswith("/api/workbench/"):
                 slug = p[len("/api/workbench/"):]
                 return self._json(workbench(slug, q.get("qid", [""])[0]))
+            if p.startswith("/api/samples/"):
+                import sample as S
+                slug = p[len("/api/samples/"):]
+                try:
+                    limit = max(1, min(2000, int(q.get("limit", ["300"])[0])))
+                except ValueError:
+                    limit = 300
+                return self._json(S.list_samples(
+                    slug, date=q.get("date", [""])[0], platform=q.get("platform", [""])[0],
+                    qid=q.get("qid", [""])[0], flag=q.get("flag", [""])[0], limit=limit))
+            if p.startswith("/api/sample/"):
+                import sample as S
+                slug = p[len("/api/sample/"):]
+                r = S.get_sample(slug, q.get("key", [""])[0])
+                return self._json(r or {"error": "找不到该样本"}, 200 if r else 404)
+            if p.startswith("/api/collect/queue/"):
+                # 浏览器插件的采样队列：按意图分组挑题 + 需人工采的平台
+                import sample as S
+                slug = p[len("/api/collect/queue/"):]
+                cfg = G.load_config(slug)
+                try:
+                    limit = max(1, min(200, int(q.get("limit", ["20"])[0])))
+                except ValueError:
+                    limit = 20
+                intent = q.get("intent", [""])[0]
+                picked = [g for g in (q.get("groups", [""])[0] or "").split(",") if g.strip()]
+                if not picked and intent == "buyer":
+                    picked = sorted(S.BUYER_GROUPS)
+                allq = cfg.get("questions", [])
+                qs = [x for x in allq if not picked or x.get("group") in picked][:limit]
+                counts: dict[str, int] = {}
+                for x in allq:
+                    g2 = x.get("group") or "未分组"
+                    counts[g2] = counts.get(g2, 0) + 1
+                groups = [{"name": g2, "count": c,
+                           "buyer": g2 in S.BUYER_GROUPS} for g2, c in
+                          sorted(counts.items(), key=lambda kv: -kv[1])]
+                plats = [{"code": c, "label": lb, "market": mk}
+                         for c, (lb, mk) in S.MANUAL_ONLY.items()]
+                plats += [{"code": c, "label": s2["name"], "market": s2["market"]}
+                          for c, s2 in S.PROVIDERS.items() if not S.available(c)]
+                return self._json({"slug": slug, "brand": cfg.get("brand", {}).get("name", ""),
+                                   "questions": qs, "platforms": plats,
+                                   "groups": groups, "selected": picked})
             if p == "/api/keys":
                 import sample as S
                 rows = []
@@ -286,6 +427,8 @@ class Handler(BaseHTTPRequestHandler):
                 for code, spec in P.PUBLISHERS.items():
                     cfg = P._cfg(slug, code)
                     pubs.append({"code": code, "name": spec["name"], "note": spec["note"],
+                                 "market": spec.get("market", "general"),
+                                 "guide": spec.get("guide") or {},
                                  "env": spec["env"], "missing": P.missing_env(code),
                                  "cfg": [{"key": k, "hint": h, "value": cfg.get(k, "")}
                                          for k, h in spec["cfg"]]})
@@ -360,6 +503,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ POST
     def do_POST(self):
+        if not self._auth():
+            return
         p = unquote(urlparse(self.path).path)
         try:
             body = self._body()
@@ -398,6 +543,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "message": "GeoLook 伺服器正在關閉"})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
+            if p.startswith("/api/sample/"):
+                import sample as S
+                slug = p[len("/api/sample/"):]
+                key = body.get("key") or ""
+                if not key:
+                    return self._json({"ok": False, "error": "缺少 key"}, 400)
+                res = S.patch_sample(slug, key, body.get("patch") or {})
+                return self._json(res, 200 if res.get("ok") else 400)
+
+            if p.startswith("/api/collect/"):
+                # 浏览器插件回传样本。服务只绑 127.0.0.1，来源即本机用户。
+                import sample as S
+                slug = p[len("/api/collect/"):]
+                records = body.get("records")
+                if not isinstance(records, list) or not records:
+                    return self._json({"ok": False, "error": "records 必须是非空数组"}, 400)
+                if len(records) > 200:
+                    return self._json({"ok": False, "error": "单次最多 200 条"}, 400)
+                # 采样/导入类任务运行中会写同一份当日样本文件，先挡回避免并发写丢行
+                jid = J.running_for(slug)
+                job = J.get(jid) if jid else None
+                if job and job.get("action") in ("sample", "sample-import", "serve", "cycle", "autopilot"):
+                    return self._json({"ok": False,
+                                       "error": f"任务「{job.get('label') or job.get('action')}」正在运行，"
+                                                "会写同一份样本文件——等它结束后再上传"}, 409)
+                with G.project_lock(slug):
+                    res = S.collect_import(slug, records)
+                return self._json(res, 200 if res.get("ok") else 400)
 
             if p.startswith("/api/job/") and p.endswith("/stop"):
                 jid = p[len("/api/job/"):-len("/stop")]
@@ -600,12 +773,20 @@ def _monitor_loop():
         time.sleep(1800)
 
 
-def run(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True):
+def run(port: int = 8765, open_browser: bool = True,
+        host: str | None = None, token: str | None = None):
+    host = host or os.environ.get("GEOLOOK_HOST") or "127.0.0.1"
+    token = token or os.environ.get("GEOLOOK_TOKEN") or None
+    if host not in ("127.0.0.1", "localhost") and not token:
+        G.die(f"绑定到 {host} 会把看板暴露给网络上的所有人。"
+              "先设置访问令牌再启动：export GEOLOOK_TOKEN=$(openssl rand -hex 16)")
+    Handler.TOKEN = token
     J.reap_orphans()  # 回收上次服务留下的 running 僵尸记录，恢复并发保护
     threading.Thread(target=_monitor_loop, daemon=True).start()
     srv = ThreadingHTTPServer((host, port), Handler)
-    url = f"http://{host}:{port}/"
-    G.info(f"看板已启动：{url}（Ctrl+C 退出）")
+    url = f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}/"
+    G.info(f"看板已启动：{url}（Ctrl+C 退出）"
+           + ("，访问需令牌（GEOLOOK_TOKEN）" if token else ""))
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
