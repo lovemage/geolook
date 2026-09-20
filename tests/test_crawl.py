@@ -78,6 +78,32 @@ class TestFetchRetry(unittest.TestCase):
             res = G.fetch("http://x.test/", retries=0, ua="AI-Bot/1.0")
         self.assertEqual(res["status"], 403)
         self.assertEqual(get.call_count, 1)
+    def test_prefers_traditional_chinese_and_allows_override(self):
+        with mock.patch.object(G.requests, "get", return_value=FakeResp(200)) as get:
+            G.fetch("http://x.test/", retries=0)
+        accept = get.call_args.kwargs["headers"]["Accept-Language"]
+        self.assertTrue(accept.startswith("zh-TW,zh-Hant"))
+
+        custom = "zh-HK,zh-Hant;q=0.9,en;q=0.8"
+        with mock.patch.dict(G.os.environ, {"GEO_ACCEPT_LANGUAGE": custom}), \
+             mock.patch.object(G.requests, "get", return_value=FakeResp(200)) as get:
+            G.fetch("http://x.test/", retries=0)
+        self.assertEqual(get.call_args.kwargs["headers"]["Accept-Language"], custom)
+
+
+class TestLanguageNormalization(unittest.TestCase):
+    def test_analyze_page_keeps_original_and_normalized_text(self):
+        html = "<html lang='zh-CN'><main><p>这是当前项目的简体中文说明。</p>" \
+               "<pre><code>标签 = '简体代码'</code></pre></main></html>"
+        page = crawl.analyze_page("https://example.com", {
+            "html": html, "final_url": "https://example.com", "status": 200, "error": ""
+        })
+        self.assertEqual(page["language"], "zh-Hans")
+        self.assertIn("这是当前项目", page["text"])
+        self.assertIn("這是目前專案", page["text_zh_tw"])
+        self.assertIn("标签 = '简体代码'", page["text_zh_tw"])
+        self.assertEqual(page["normalization"]["target"], "zh-TW")
+        self.assertTrue(page["normalization"]["changed"])
 
 
 class TestCrawlHealth(unittest.TestCase):

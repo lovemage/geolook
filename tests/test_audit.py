@@ -98,7 +98,16 @@ class TestLanguage(unittest.TestCase):
 
     def test_chinese_not_japanese(self):
         text = "这是一个中文页面，用来测试语言检测是否会把纯中文误判成日文。" * 3
-        self.assertEqual(G.page_language(text), "zh")
+        self.assertEqual(G.page_language(text), "zh-Hans")
+
+    def test_traditional_chinese_detected(self):
+        text = "這是一個繁體中文頁面，用來測試語言辨識是否會正確分類。" * 3
+        self.assertEqual(G.page_language(text), "zh-Hant")
+
+    def test_script_profile_includes_confidence(self):
+        profile = G.chinese_script_profile("这是简体中文测试内容")
+        self.assertEqual(profile["language"], "zh-Hans")
+        self.assertGreater(profile["confidence"], 0.8)
 
     def test_english_still_english(self):
         text = "This is an English page about our product and services for testing." * 3
@@ -201,6 +210,8 @@ class TestLanguageRecompute(unittest.TestCase):
         lc = out["language_coverage"]
         self.assertEqual(lc["ja_pages"], 1)
         self.assertEqual(lc["zh_pages"], 1)
+        self.assertEqual(lc["zh_hans_pages"], 1)
+        self.assertEqual(lc["zh_hant_pages"], 0)
 
 
 if __name__ == "__main__":

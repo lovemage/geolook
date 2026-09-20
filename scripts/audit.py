@@ -304,7 +304,9 @@ def run(slug: str) -> dict:
             lang_dist[lang] = lang_dist.get(lang, 0) + 1
     # mixed 单列，不双计进 zh/en——双计会让「中英对等」判断失真
     en_pages = lang_dist.get("en", 0)
-    zh_pages = lang_dist.get("zh", 0)
+    zh_hans_pages = lang_dist.get("zh-Hans", 0)
+    zh_hant_pages = lang_dist.get("zh-Hant", 0)
+    zh_pages = lang_dist.get("zh", 0) + zh_hans_pages + zh_hant_pages
     ja_pages = lang_dist.get("ja", 0)
     content_pages = sum(lang_dist.values())
     hreflang_pages = sum(1 for p in pages
@@ -476,6 +478,7 @@ def run(slug: str) -> dict:
         "market": market,
         "site": site,
         "language_coverage": {"distribution": lang_dist, "zh_pages": zh_pages,
+                              "zh_hans_pages": zh_hans_pages, "zh_hant_pages": zh_hant_pages,
                               "en_pages": en_pages, "ja_pages": ja_pages,
                               "content_pages": content_pages, "hreflang_pages": hreflang_pages,
                               "multilingual": multilingual},

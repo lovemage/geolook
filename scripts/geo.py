@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import geolib as G  # noqa: E402
 except ModuleNotFoundError as e:
-    raise SystemExit(f"缺少依赖：{e.name}。请先 pip3 install requests beautifulsoup4 lxml") from e
+    raise SystemExit(f"缺少依赖：{e.name}。请先 pip3 install -r requirements.txt") from e
 
 
 DEFAULT_PLATFORMS = {
@@ -621,8 +621,8 @@ def main():
     s.set_defaults(func=cmd_serve)
 
     s = sub.add_parser("ui", help="启动可观测看板（趋势、工单、信源、验收历史）")
-    s.add_argument("--host", default="127.0.0.1",
-                   help="监听地址（默认 127.0.0.1；可指定 Tailscale IP 供 Tailnet 访问）")
+    s.add_argument("--host", default=None,
+                   help="监听地址（默认优先使用 Tailscale IPv4，无法取得时回退 127.0.0.1）")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--no-open", action="store_true", dest="no_open")
     s.set_defaults(func=cmd_ui)

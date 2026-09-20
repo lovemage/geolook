@@ -89,6 +89,10 @@ def analyze_page(url: str, res: dict) -> dict:
     soup = G.parse_html(res["html"])
     text = G.main_text(soup)
     blocks = G.jsonld(soup)
+    lang_attr = soup.html.get("lang", "") if soup.html else ""
+    language = G.page_language(text, lang_attr)
+    script_profile = (G.chinese_script_profile(text, lang_attr)
+                      if language.startswith("zh") else None)
 
     h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
     h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
@@ -109,7 +113,7 @@ def analyze_page(url: str, res: dict) -> dict:
         if u and u.startswith("http") and not G.same_site(url, u):
             ext += 1
 
-    return {
+    page = {
         "url": url,
         "final_url": res["final_url"],
         "status": res["status"],
@@ -121,7 +125,7 @@ def analyze_page(url: str, res: dict) -> dict:
         "x_robots_tag": res.get("x_robots_tag", ""),
         "hreflang_count": len(hreflangs),
         "canonical": (canonical.get("href", "") if canonical else ""),
-        "lang": (soup.html.get("lang", "") if soup.html else ""),
+        "lang": lang_attr,
         "h1": h1,
         "h2": h2,
         "h3_count": len(h3),
@@ -133,11 +137,22 @@ def analyze_page(url: str, res: dict) -> dict:
         "jsonld_types": G.jsonld_types(blocks),
         "jsonld_raw": blocks,
         "word_count": G.word_count(text),
-        "language": G.page_language(text, (soup.html.get("lang", "") if soup.html else "")),
+        "language": language,
+        "language_confidence": (script_profile or {}).get("confidence"),
         "cjk_ratio": G.cjk_ratio(text),
         "text": text[:20000],
         "fetched_at": G.now_iso(),
     }
+    if script_profile:
+        normalized = G.to_zh_tw(text)
+        page["text_zh_tw"] = normalized[:20000]
+        page["normalization"] = {
+            "source_script": script_profile["language"],
+            "target": "zh-TW",
+            "confidence": script_profile["confidence"],
+            "changed": normalized != text,
+        }
+    return page
 
 
 # 关注的 AI 抓取器（robots 判定用产品名做 UA 匹配）
